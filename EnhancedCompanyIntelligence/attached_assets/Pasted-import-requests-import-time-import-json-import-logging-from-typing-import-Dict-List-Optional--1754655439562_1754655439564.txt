@@ -1,0 +1,281 @@
+import requests
+import time
+import json
+import logging
+from typing import Dict, List, Optional, Union
+from datetime import datetime
+from requests.exceptions import RequestException, HTTPError
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("companies_house")
+
+class CompaniesHouseAPI:
+    """
+    Enhanced Companies House API client with improved error handling,
+    rate limiting, and data validation.
+    """
+    
+    BASE_URL = "https://api.company-information.service.gov.uk"
+    
+    def __init__(self, api_key: str):
+        """
+        Initialize the API client with authentication.
+        
+        Args:
+            api_key: Companies House API key
+        """
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.auth = (api_key, '')
+        self.last_request_time = 0
+        self.min_request_interval = 0.5  # 500ms between requests (respecting rate limits)
+        
+        # Initialize cache
+        self.cache = {}
+        self.cache_expiry = 3600  # 1 hour cache expiry
+        
+    def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Dict:
+        """
+        Make a request to the Companies House API with rate limiting and error handling.
+        
+        Args:
+            endpoint: API endpoint path
+            params: Query parameters
+            
+        Returns:
+            JSON response data
+            
+        Raises:
+            RequestException: If the request fails
+        """
+        # Rate limiting
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.min_request_interval:
+            time.sleep(self.min_request_interval - elapsed)
+            
+        url = f"{self.BASE_URL}{endpoint}"
+        
+        try:
+            response = self.session.get(url, params=params)
+            self.last_request_time = time.time()
+            
+            # Handle rate limiting (HTTP 429)
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 1))
+                logger.warning(f"Rate limited. Retrying after {retry_after} seconds.")
+                time.sleep(retry_after)
+                return self._make_request(endpoint, params)
+                
+            response.raise_for_status()
+            return response.json()
+            
+        except HTTPError as e:
+            logger.error(f"HTTP error: {e}")
+            raise
+        except RequestException as e:
+            logger.error(f"Request failed: {e}")
+            raise
+            
+    def _get_cache_key(self, endpoint: str, params: Optional[Dict] = None) -> str:
+        """Generate a cache key for the request."""
+        param_str = json.dumps(params, sort_keys=True) if params else ""
+        return f"{endpoint}?{param_str}"
+        
+    def _is_cache_valid(self, cache_key: str) -> bool:
+        """Check if cached data is still valid."""
+        if cache_key not in self.cache:
+            return False
+        timestamp, _ = self.cache[cache_key]
+        return (time.time() - timestamp) < self.cache_expiry
+        
+    def get_company_profile(self, company_number: str, use_cache: bool = True) -> Dict:
+        """
+        Get detailed company profile with enhanced data validation.
+        
+        Args:
+            company_number: Companies House company number
+            use_cache: Whether to use cached data if available
+            
+        Returns:
+            Company profile data
+        """
+        endpoint = f"/company/{company_number}"
+        cache_key = self._get_cache_key(endpoint)
+        
+        # Check cache first
+        if use_cache and self._is_cache_valid(cache_key):
+            logger.info(f"Using cached data for company {company_number}")
+            return self.cache[cache_key][1]
+            
+        try:
+            data = self._make_request(endpoint)
+            
+            # Validate and enhance data
+            enhanced_data = self._validate_and_enhance_company_data(data)
+            
+            # Cache the result
+            self.cache[cache_key] = (time.time(), enhanced_data)
+            
+            return enhanced_data
+            
+        except RequestException as e:
+            logger.error(f"Failed to get company profile for {company_number}: {e}")
+            raise
+            
+    def _validate_and_enhance_company_data(self, data: Dict) -> Dict:
+        """
+        Validate and enhance company data with additional fields.
+        
+        Args:
+            data: Raw company data from API
+            
+        Returns:
+            Enhanced company data
+        """
+        # Ensure required fields exist
+        required_fields = ['company_name', 'company_number', 'company_status']
+        for field in required_fields:
+            if field not in data:
+                raise ValueError(f"Missing required field: {field}")
+                
+        # Add additional calculated fields
+        data['data_retrieved_at'] = datetime.now().isoformat()
+        
+        # Add status interpretation
+        status_interpretations = {
+            'active': 'Company is actively trading',
+            'dissolved': 'Company has been dissolved',
+            'liquidation': 'Company is in liquidation',
+            'receivership': 'Company is in receivership',
+            'converted-closed': 'Company has been converted and closed',
+            'insolvency-proceedings': 'Company is undergoing insolvency proceedings'
+        }
+        data['status_interpretation'] = status_interpretations.get(
+            data['company_status'], 
+            'Unknown status'
+        )
+        
+        # Add age of company in years
+        if 'date_of_creation' in data:
+            try:
+                creation_date = datetime.strptime(data['date_of_creation'], '%Y-%m-%d')
+                now = datetime.now()
+                data['age_years'] = (now - creation_date).days / 365.25
+            except (ValueError, TypeError):
+                data['age_years'] = None
+                
+        return data
+        
+    def search_companies(self, query: str, items_per_page: int = 100) -> List[Dict]:
+        """
+        Search for companies with enhanced error handling and pagination.
+        
+        Args:
+            query: Search term
+            items_per_page: Number of results per page
+            
+        Returns:
+            List of company search results
+        """
+        endpoint = "/search/companies"
+        params = {
+            "q": query,
+            "items_per_page": items_per_page
+        }
+        
+        try:
+            data = self._make_request(endpoint, params)
+            return data.get('items', [])
+            
+        except RequestException as e:
+            logger.error(f"Failed to search companies with query '{query}': {e}")
+            raise
+            
+    def get_company_officers(self, company_number: str) -> List[Dict]:
+        """
+        Get company officers with enhanced data validation.
+        
+        Args:
+            company_number: Companies House company number
+            
+        Returns:
+            List of company officers
+        """
+        endpoint = f"/company/{company_number}/officers"
+        
+        try:
+            data = self._make_request(endpoint)
+            officers = data.get('items', [])
+            
+            # Enhance officer data
+            for officer in officers:
+                if 'appointed_on' in officer:
+                    try:
+                        appointed_date = datetime.strptime(officer['appointed_on'], '%Y-%m-%d')
+                        officer['years_in_position'] = (datetime.now() - appointed_date).days / 365.25
+                    except (ValueError, TypeError):
+                        officer['years_in_position'] = None
+                        
+            return officers
+            
+        except RequestException as e:
+            logger.error(f"Failed to get officers for company {company_number}: {e}")
+            raise
+            
+    def get_company_filing_history(self, company_number: str) -> List[Dict]:
+        """
+        Get company filing history with enhanced categorization.
+        
+        Args:
+            company_number: Companies House company number
+            
+        Returns:
+            List of filing history items
+        """
+        endpoint = f"/company/{company_number}/filing-history"
+        
+        try:
+            data = self._make_request(endpoint)
+            filings = data.get('items', [])
+            
+            # Categorize filings
+            for filing in filings:
+                filing['category'] = self._categorize_filing(filing.get('type', ''))
+                
+            return filings
+            
+        except RequestException as e:
+            logger.error(f"Failed to get filing history for company {company_number}: {e}")
+            raise
+            
+    def _categorize_filing(self, filing_type: str) -> str:
+        """
+        Categorize filing types into broader categories.
+        
+        Args:
+            filing_type: Original filing type
+            
+        Returns:
+            Broader category
+        """
+        categories = {
+            'accounts': ['AA', 'AB', 'AC', 'AD', 'AE', 'AF', 'AG', 'AH', 'AZ'],
+            'annual-return': ['AR01', 'AR02', 'AR03', 'AR04', 'AR05', 'AR06', 'AR07', 'AR08', 'AR09', 'AR10', 'AR11'],
+            'change-of-name': ['NM01', 'NM02', 'NM04', 'NM05', 'NM06'],
+            'officer-appointment': ['AP01', 'AP02', 'AP03', 'AP04'],
+            'officer-termination': ['TM01', 'TM02', 'TM03'],
+            'capital': ['SH01', 'SH02', 'SH03', 'SH04', 'SH05', 'SH06', 'SH07', 'SH08', 'SH09', 'SH10'],
+            'mortgage': ['MG01', 'MG02', 'MG03', 'MG04', 'MG05', 'MG06', 'MG07', 'MG08', 'MG09', 'MG10'],
+            'incorporation': ['IN01'],
+            'dissolution': ['DS01']
+        }
+        
+        for category, types in categories.items():
+            if filing_type in types:
+                return category
+                
+        return 'other'
